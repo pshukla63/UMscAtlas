@@ -16,7 +16,7 @@ Analysis of healthy, primary, and metastatic uveal melanoma using scRNA-seq and 
 | secondary_mutation | Secondary Mutation | Identifies secondary mutation (BAP1, SF3B1 or EIF1AX) for each sample (assessed by WES or targeted sequencing) |
 | Patient_nr | Patient Number | assigns a patient number (P1-P36) to each sequenced sample and shows which patients have multiple samples sequenced |
 | organ | Organ | Identifies organ from which sample is originating |
-| Gender | Sex | Identifies sex of patient sample was derived from |
+| Gender | Gender | Identifies gender of patient sample was derived from |
 | TreatmentStage_ofProcessedSample | Treatment | Indicates last treatment of patient before sampling of the sequenced sample |
 | Stage_atDiagnosis | Stage at Diagnosis | Disease stage at first diagnosis |
 | Mets_atDiagnosis | Metastasis at Diagnosis | Identifies if metastasis was present at disease prognosis |
