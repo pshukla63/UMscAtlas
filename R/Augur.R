@@ -49,6 +49,9 @@ seu <- subset(seu, idents = "primary")
 Idents(seu) <- "secondary_mutation"
 seu <- subset(seu, idents = c("none", "unknown"), invert = TRUE)
 
+# save metadata for compositional analysis in "Compositions.R" script
+qsave(seu@metadata, file = "../pUM_secondarymutation_metadata.qs")
+
 # run standard Seurat processing for subset
 DefaultAssay(seu) <- "RNA"
 seu <- NormalizeData(seu, verbose = FALSE)
