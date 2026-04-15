@@ -41,6 +41,10 @@ second_mutations_col <- c(
 # load full data set
 seu <- qread("../full_dataset.qs")
 
+# select only TME cells
+Idents(seu) <- "majority_celltype"
+seu <- subset(seu, idents = "Melanoma cells", invert = TRUE)
+
 # select only primaries
 Idents(seu) <- "origin"
 seu <- subset(seu, idents = "primary")
@@ -432,4 +436,4 @@ ggplot(GO_results@result, aes(x = NES, y = fct_reorder(Description, NES), fill =
   theme_bw(base_size = 14)
 
 # save metadata for compositional analysis in "Compositions.R" script
-qsave(seu@metadata, file = "../pUM_secondarymutation_metadata.qs")
+qsave(seu@metadata, file = "../pUM_secondarymutation_metadata_TME.qs")
