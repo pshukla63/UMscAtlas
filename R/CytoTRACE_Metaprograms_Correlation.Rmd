@@ -1,0 +1,338 @@
+---
+title: "p31662 UM Atlas - CytoTRACE2 vs Metaprogram Correlation Analysis"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r script-info, include=FALSE}
+# This script was used to create the following figures:
+# Methods (correlation between CytoTRACE2 stemness scores and the 67 GeneNMF cancer metaprograms)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+## Overview
+
+This report analyzes the correlation between CytoTRACE2 stemness scores and specific cancer metaprogram expression in malignant cells from the UM Atlas dataset.
+
+**Requested metaprograms:**
+
+- **MP6 (Hypoxia)**: Stress/hypoxia response
+- **MP9**: Stress-related metaprogram
+- **MP45**: Tissue-specific metaprogram
+
+## Data Loading
+
+```{r load_libraries}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(ggpubr)
+library(cowplot)
+library(qs)
+library(readr)
+
+# Load Victoria's color palettes
+source("colors.R")
+
+# CRITICAL: Reorder origin_colors to match disease progression (healthy → primary → metastasis)
+origin_order <- c("healthy", "primary", "metastasis")
+origin_colors <- origin_colors[origin_order]
+
+output_dir <- "Outputs/"
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r load_data}
+# Load melanocytic cells with metaprogram scores
+cat("Loading melanocytic cells with metaprogram scores...\n")
+melanocytic <- qread(
+  "../melanocytic_metaprograms.qs2",
+  nthreads = 16
+)
+cat("  - Cells:", ncol(melanocytic), "\n")
+
+# Load UM atlas with CytoTRACE2 scores
+cat("\nLoading CytoTRACE2 data from UM atlas...\n")
+um_atlas <- qread(
+  "../UM_atlas_cytotrace2.qs2",
+  nthreads = 16
+)
+cat("  - Cells:", ncol(um_atlas), "\n")
+
+# Find common cells
+common_cells <- intersect(colnames(melanocytic), colnames(um_atlas))
+cat("\nCommon cells:", length(common_cells), "\n")
+
+# Transfer CytoTRACE2 scores to melanocytic object
+melanocytic$CytoTRACE2_Score <- NA
+melanocytic@meta.data[common_cells, "CytoTRACE2_Score"] <- um_atlas@meta.data[common_cells, "CytoTRACE2_Score"]
+
+# Clean up
+rm(um_atlas)
+gc()
+
+# Filter to cells with both CytoTRACE2 and MP scores
+has_cyto <- !is.na(melanocytic$CytoTRACE2_Score)
+cat("Cells with CytoTRACE2 scores:", sum(has_cyto), "\n")
+```
+
+```{r identify_mp_columns}
+# Find metaprogram columns
+ucell_cols <- grep("^MP[0-9]+", colnames(melanocytic@meta.data), value = TRUE)
+cat("Available metaprogram columns:", length(ucell_cols), "\n\n")
+
+# Find specific MPs requested
+mp6_col <- grep("^MP6 ", ucell_cols, value = TRUE)
+mp9_col <- grep("^MP9 ", ucell_cols, value = TRUE)
+mp45_col <- grep("^MP45 ", ucell_cols, value = TRUE)
+
+cat("Selected columns:\n")
+cat("  MP6:", mp6_col, "\n")
+cat("  MP9:", mp9_col, "\n")
+cat("  MP45:", mp45_col, "\n")
+
+# Create analysis dataframe (malignant cells with CytoTRACE2)
+analysis_df <- melanocytic@meta.data %>%
+  filter(!is.na(CytoTRACE2_Score)) %>%
+  select(CytoTRACE2_Score, origin, all_of(c(mp6_col, mp9_col, mp45_col)))
+
+# Rename for clarity
+colnames(analysis_df) <- c("CytoTRACE2_Score", "origin", "MP6", "MP9", "MP45")
+
+cat("\nAnalysis dataframe:\n")
+cat("  - Cells:", nrow(analysis_df), "\n")
+cat("  - Columns:", paste(colnames(analysis_df), collapse = ", "), "\n")
+
+# Enforce disease progression order
+analysis_df$origin <- factor(analysis_df$origin, levels = c("healthy", "primary", "metastasis"))
+```
+
+# {.tabset}
+
+## MP6 (Hypoxia) Correlation
+
+```{r mp6_correlation, fig.width = 10, fig.height = 8}
+# Spearman correlation
+cor_mp6 <- cor.test(analysis_df$CytoTRACE2_Score, analysis_df$MP6,
+                    method = "spearman", exact = FALSE)
+
+cat("=== MP6 (Hypoxia) vs CytoTRACE2 Score ===\n")
+cat("Spearman rho:", round(cor_mp6$estimate, 4), "\n")
+cat("p-value:", format(cor_mp6$p.value, scientific = TRUE, digits = 3), "\n\n")
+
+# Scatterplot
+p_mp6 <- ggplot(analysis_df, aes(x = CytoTRACE2_Score, y = MP6)) +
+  geom_point(aes(color = origin), alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "lm", color = "black", linewidth = 1) +
+  stat_cor(method = "spearman", label.x = 0.05, label.y = max(analysis_df$MP6) * 0.95,
+           size = 5, cor.coef.name = "rho") +
+  scale_color_manual(values = origin_colors) +
+  labs(
+    title = paste0("CytoTRACE2 Score vs MP6 (", mp6_col, ")"),
+    subtitle = paste0("n = ", nrow(analysis_df), " malignant/melanocytic cells"),
+    x = "CytoTRACE2 Score (Stemness)",
+    y = "MP6 Score (UCell)",
+    color = "Origin"
+  ) +
+  theme_cowplot(font_size = 14) +
+  theme(legend.position = "right")
+
+print(p_mp6)
+ggsave(file.path(output_dir, "correlation_cytotrace2_mp6.png"), p_mp6,
+       width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+### Faceted by Origin
+
+```{r mp6_faceted, fig.width = 14, fig.height = 6}
+p_mp6_facet <- ggplot(analysis_df, aes(x = CytoTRACE2_Score, y = MP6)) +
+  geom_point(aes(color = origin), alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "lm", color = "black", linewidth = 1) +
+  stat_cor(method = "spearman", size = 4, cor.coef.name = "rho") +
+  scale_color_manual(values = origin_colors) +
+  facet_wrap(~ origin, nrow = 1) +
+  labs(
+    title = "CytoTRACE2 vs MP6 by Disease Stage",
+    x = "CytoTRACE2 Score (Stemness)",
+    y = "MP6 Score (UCell)"
+  ) +
+  theme_cowplot(font_size = 12) +
+  theme(legend.position = "none")
+
+print(p_mp6_facet)
+ggsave(file.path(output_dir, "correlation_cytotrace2_mp6_faceted.png"), p_mp6_facet,
+       width = 14, height = 6, dpi = 300, bg = "white")
+```
+
+## MP9 Correlation
+
+```{r mp9_correlation, fig.width = 10, fig.height = 8}
+# Spearman correlation
+cor_mp9 <- cor.test(analysis_df$CytoTRACE2_Score, analysis_df$MP9,
+                    method = "spearman", exact = FALSE)
+
+cat("=== MP9 vs CytoTRACE2 Score ===\n")
+cat("Spearman rho:", round(cor_mp9$estimate, 4), "\n")
+cat("p-value:", format(cor_mp9$p.value, scientific = TRUE, digits = 3), "\n\n")
+
+# Scatterplot
+p_mp9 <- ggplot(analysis_df, aes(x = CytoTRACE2_Score, y = MP9)) +
+  geom_point(aes(color = origin), alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "lm", color = "black", linewidth = 1) +
+  stat_cor(method = "spearman", label.x = 0.05, label.y = max(analysis_df$MP9) * 0.95,
+           size = 5, cor.coef.name = "rho") +
+  scale_color_manual(values = origin_colors) +
+  labs(
+    title = paste0("CytoTRACE2 Score vs MP9 (", mp9_col, ")"),
+    subtitle = paste0("n = ", nrow(analysis_df), " malignant/melanocytic cells"),
+    x = "CytoTRACE2 Score (Stemness)",
+    y = "MP9 Score (UCell)",
+    color = "Origin"
+  ) +
+  theme_cowplot(font_size = 14) +
+  theme(legend.position = "right")
+
+print(p_mp9)
+ggsave(file.path(output_dir, "correlation_cytotrace2_mp9.png"), p_mp9,
+       width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+### Faceted by Origin
+
+```{r mp9_faceted, fig.width = 14, fig.height = 6}
+p_mp9_facet <- ggplot(analysis_df, aes(x = CytoTRACE2_Score, y = MP9)) +
+  geom_point(aes(color = origin), alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "lm", color = "black", linewidth = 1) +
+  stat_cor(method = "spearman", size = 4, cor.coef.name = "rho") +
+  scale_color_manual(values = origin_colors) +
+  facet_wrap(~ origin, nrow = 1) +
+  labs(
+    title = "CytoTRACE2 vs MP9 by Disease Stage",
+    x = "CytoTRACE2 Score (Stemness)",
+    y = "MP9 Score (UCell)"
+  ) +
+  theme_cowplot(font_size = 12) +
+  theme(legend.position = "none")
+
+print(p_mp9_facet)
+ggsave(file.path(output_dir, "correlation_cytotrace2_mp9_faceted.png"), p_mp9_facet,
+       width = 14, height = 6, dpi = 300, bg = "white")
+```
+
+## MP45 Correlation
+
+```{r mp45_correlation, fig.width = 10, fig.height = 8}
+# Spearman correlation
+cor_mp45 <- cor.test(analysis_df$CytoTRACE2_Score, analysis_df$MP45,
+                     method = "spearman", exact = FALSE)
+
+cat("=== MP45 vs CytoTRACE2 Score ===\n")
+cat("Spearman rho:", round(cor_mp45$estimate, 4), "\n")
+cat("p-value:", format(cor_mp45$p.value, scientific = TRUE, digits = 3), "\n\n")
+
+# Scatterplot
+p_mp45 <- ggplot(analysis_df, aes(x = CytoTRACE2_Score, y = MP45)) +
+  geom_point(aes(color = origin), alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "lm", color = "black", linewidth = 1) +
+  stat_cor(method = "spearman", label.x = 0.05, label.y = max(analysis_df$MP45) * 0.95,
+           size = 5, cor.coef.name = "rho") +
+  scale_color_manual(values = origin_colors) +
+  labs(
+    title = paste0("CytoTRACE2 Score vs MP45 (", mp45_col, ")"),
+    subtitle = paste0("n = ", nrow(analysis_df), " malignant/melanocytic cells"),
+    x = "CytoTRACE2 Score (Stemness)",
+    y = "MP45 Score (UCell)",
+    color = "Origin"
+  ) +
+  theme_cowplot(font_size = 14) +
+  theme(legend.position = "right")
+
+print(p_mp45)
+ggsave(file.path(output_dir, "correlation_cytotrace2_mp45.png"), p_mp45,
+       width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+### Faceted by Origin
+
+```{r mp45_faceted, fig.width = 14, fig.height = 6}
+p_mp45_facet <- ggplot(analysis_df, aes(x = CytoTRACE2_Score, y = MP45)) +
+  geom_point(aes(color = origin), alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "lm", color = "black", linewidth = 1) +
+  stat_cor(method = "spearman", size = 4, cor.coef.name = "rho") +
+  scale_color_manual(values = origin_colors) +
+  facet_wrap(~ origin, nrow = 1) +
+  labs(
+    title = "CytoTRACE2 vs MP45 by Disease Stage",
+    x = "CytoTRACE2 Score (Stemness)",
+    y = "MP45 Score (UCell)"
+  ) +
+  theme_cowplot(font_size = 12) +
+  theme(legend.position = "none")
+
+print(p_mp45_facet)
+ggsave(file.path(output_dir, "correlation_cytotrace2_mp45_faceted.png"), p_mp45_facet,
+       width = 14, height = 6, dpi = 300, bg = "white")
+```
+
+## Summary Statistics
+
+```{r summary_table}
+# Create correlation summary
+correlation_summary <- data.frame(
+  Metaprogram = c("MP6 (Hypoxia)", "MP9", "MP45"),
+  Full_Name = c(mp6_col, mp9_col, mp45_col),
+  Spearman_rho = c(cor_mp6$estimate, cor_mp9$estimate, cor_mp45$estimate),
+  P_value = c(cor_mp6$p.value, cor_mp9$p.value, cor_mp45$p.value),
+  N_cells = nrow(analysis_df)
+)
+
+correlation_summary$Significance <- ifelse(correlation_summary$P_value < 0.001, "***",
+                                    ifelse(correlation_summary$P_value < 0.01, "**",
+                                    ifelse(correlation_summary$P_value < 0.05, "*", "ns")))
+
+cat("=== Correlation Summary ===\n\n")
+print(knitr::kable(correlation_summary, digits = 4,
+                   caption = "Spearman correlations between CytoTRACE2 Score and Metaprogram Expression"))
+
+# Save summary
+write_csv(correlation_summary, file.path(output_dir, "cytotrace2_mp_correlation_summary.csv"))
+cat("\nSaved to:", file.path(output_dir, "cytotrace2_mp_correlation_summary.csv"), "\n")
+```
+
+### Combined Correlation Matrix
+
+```{r correlation_matrix, fig.width = 8, fig.height = 6}
+# Correlation matrix for all 3 MPs + CytoTRACE2
+cor_matrix <- cor(analysis_df[, c("CytoTRACE2_Score", "MP6", "MP9", "MP45")],
+                  method = "spearman", use = "pairwise.complete.obs")
+
+# Create heatmap
+library(pheatmap)
+pheatmap(cor_matrix,
+         display_numbers = TRUE,
+         number_format = "%.3f",
+         main = "Spearman Correlation Matrix:\nCytoTRACE2 vs Metaprograms",
+         fontsize = 12,
+         fontsize_number = 10)
+```
+
+## Session Information
+
+```{r session_info}
+sessionInfo()
+```
