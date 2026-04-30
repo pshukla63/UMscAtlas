@@ -1,0 +1,652 @@
+---
+title: "p31662 - Boston Cohort - Unified 3-Panel Spatial Plots: Cell Types, CytoTRACE2, CNV"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package="ezRun", lib.loc=.libPaths())
+    css: !expr system.file("templates/fgcz.css", package="ezRun", lib.loc=.libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r script-info, include=FALSE}
+# This script was used to create the following figures:
+# Figure 5 (unified spatial visualization of CytoTRACE2 and CNV scores on Boston Xenium)
+```
+
+#  {.tabset}
+
+## Overview
+
+Started on `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+
+This analysis generates **unified 3-panel spatial plots** for the Boston Sullivan Xenium cohort with consistent orientation across all panels:
+
+1. **Panel 1**: Cell type annotations
+2. **Panel 2**: CytoTRACE2 stemness scores
+3. **Panel 3**: CNV (copy number variation) scores
+
+**Key Fix**: All panels use Seurat's coordinate system from the spatial xenium object, ensuring perfect alignment.
+
+**Data Sources:**
+- Spatial object: `merged_xenium_all_samples.qs2` from p36005
+- CytoTRACE2 scores: CSV from p31662 analysis
+- CNV scores: h5ad files from p36005
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 20, fig.height = 7)
+
+# Load required libraries
+library(Seurat)
+library(qs2)
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(pals)
+library(anndataR)
+
+# Set paths
+p31662_dir <- ".."
+p36005_dir <- "../Xenium_Boston_Sullivan"
+
+# Output directory
+output_dir <- file.path(p31662_dir, "Outputs/Unified_Spatial_Plots/")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+cat("=== Analysis Setup ===\n")
+cat("p31662 Atlas directory:", p31662_dir, "\n")
+cat("p36005 Boston directory:", p36005_dir, "\n")
+cat("Output directory:", output_dir, "\n\n")
+
+# Color palettes from UMscAtlas (colors.R)
+majority_celltype_col <- c(
+  "Glial cells" = "#5A5156",
+  "B/Plasma cells" = "lightslateblue",
+  "Myeloid cells" = "lightblue",
+  "T/NK cells" = "#325A9B",
+  "Melanoma cells" = "#B00068",
+  "Melanoma" = "#B00068",  # alias
+  "Melanocytes" = "#C075A6",
+  "Endothelial cells" = "chartreuse4",
+  "Epithelial cells" = "#1CBE4F",
+  "Fibroblasts" = "yellowgreen",
+  "Mesenchymal cells" = "darkgreen",
+  "Pericytes" = "olivedrab4",
+  "Smooth muscle cells" = "#1CFFCE",
+  "Photoreceptor cells" = "peachpuff3",
+  "Unknown" = "#E1E1E1FF"
+)
+cytotrace_colors <- c("#000004FF", "#3B0F70FF", "#8C2981FF", "#DE4968FF", "#FE9F6DFF", "#FCFDBFFF")
+```
+
+## Load Data {.tabset}
+
+### Load Spatial Xenium Object
+
+```{r load-xenium}
+cat("=== Loading Spatial Xenium Object ===\n")
+
+# Load spatial xenium object (has @images slot with coordinates)
+xenium_path <- file.path(p36005_dir, "merged_xenium_all_samples.qs2")
+
+if (!file.exists(xenium_path)) {
+  stop("Xenium object not found at: ", xenium_path)
+}
+
+xenium <- qs2::qs_read(xenium_path, nthreads = 16)
+
+cat("Cells:", ncol(xenium), "\n")
+cat("Genes:", nrow(xenium), "\n")
+cat("FOVs:", length(Images(xenium)), "\n")
+cat("FOV names:", paste(names(xenium@images), collapse = ", "), "\n")
+```
+
+### Identify Cell Type Column
+
+```{r identify-celltype}
+cat("\n=== Identifying Cell Type Column ===\n")
+
+# Find the cell type column
+ct_col <- NULL
+if ("CellType_Harmonized" %in% colnames(xenium@meta.data)) {
+  ct_col <- "CellType_Harmonized"
+} else if ("CellType_Clean" %in% colnames(xenium@meta.data)) {
+  ct_col <- "CellType_Clean"
+} else if ("predicted.celltype" %in% colnames(xenium@meta.data)) {
+  ct_col <- "predicted.celltype"
+} else if ("cell_type" %in% colnames(xenium@meta.data)) {
+  ct_col <- "cell_type"
+} else {
+  celltype_cols <- grep("celltype|cell_type|annotation", colnames(xenium@meta.data),
+                        ignore.case = TRUE, value = TRUE)
+  if (length(celltype_cols) > 0) {
+    ct_col <- celltype_cols[1]
+  }
+}
+
+if (!is.null(ct_col)) {
+  cat("Using cell type column:", ct_col, "\n")
+  cat("Unique cell types:", length(unique(xenium@meta.data[[ct_col]])), "\n")
+} else {
+  stop("No cell type column found in Seurat object.")
+}
+```
+
+### Extract Seurat Spatial Coordinates
+
+```{r extract-coordinates}
+cat("\n=== Extracting Seurat Spatial Coordinates ===\n")
+
+# Get tissue coordinates from ALL FOVs (not just default)
+# GetTissueCoordinates with merged object only returns first FOV by default
+cat("Extracting coordinates from all", length(Images(xenium)), "FOVs...\n")
+all_coords_list <- lapply(names(xenium@images), function(fov) {
+  coords <- GetTissueCoordinates(xenium, image = fov, which = "centroids")
+  cat("  ", fov, ":", nrow(coords), "cells\n")
+  coords
+})
+spatial_coords <- do.call(rbind, all_coords_list)
+
+cat("\nExtracted coordinates for", nrow(spatial_coords), "cells total\n")
+cat("Coordinate ranges:\n")
+cat("  x:", round(min(spatial_coords$x), 1), "-", round(max(spatial_coords$x), 1), "\n")
+cat("  y:", round(min(spatial_coords$y), 1), "-", round(max(spatial_coords$y), 1), "\n")
+```
+
+### Load CytoTRACE2 Scores
+
+```{r load-cytotrace}
+cat("\n=== Loading CytoTRACE2 Scores ===\n")
+
+# Load CytoTRACE2 scores from CSV (from 14_Xenium_Stemness_Validation.Rmd)
+cytotrace_csv <- file.path(p31662_dir, "Outputs/Xenium_Stemness/xenium_cytotrace2_scores_all_cohorts.csv")
+
+if (!file.exists(cytotrace_csv)) {
+  stop("CytoTRACE2 CSV not found at: ", cytotrace_csv)
+}
+
+cytotrace_df <- read.csv(cytotrace_csv, row.names = 1)
+
+cat("Loaded CytoTRACE2 CSV:", nrow(cytotrace_df), "cells\n")
+cat("  Columns:", paste(colnames(cytotrace_df), collapse = ", "), "\n")
+
+# Filter to Boston_Sullivan cohort only
+cytotrace_df <- cytotrace_df[cytotrace_df$Cohort == "Boston_Sullivan", ]
+cat("Filtered to Boston_Sullivan:", nrow(cytotrace_df), "cells\n")
+cat("CytoTRACE2_Score range:", round(min(cytotrace_df$CytoTRACE2_Score), 3), "-",
+    round(max(cytotrace_df$CytoTRACE2_Score), 3), "\n")
+```
+
+### Load CNV Data from h5ad Files
+
+```{r load-cnv}
+cat("\n=== Loading CNV Data from h5ad Files ===\n")
+
+# Function to calculate CNV score from X_cnv matrix
+calculate_cnv_score <- function(X_cnv) {
+  if (inherits(X_cnv, "dgRMatrix") || inherits(X_cnv, "dgCMatrix")) {
+    X_mat <- as.matrix(X_cnv)
+  } else {
+    X_mat <- as(X_cnv, "matrix")
+  }
+  sqrt(rowMeans(X_mat^2))
+}
+
+# Load CNV h5ad files (all samples consolidated in main output directory)
+cnv_output_dir <- file.path(p36005_dir, "06_InSituCNV_Outputs")
+cnv_h5ad_files <- list.files(cnv_output_dir, pattern = "_cnv\\.h5ad$", full.names = TRUE)
+
+if (length(cnv_h5ad_files) == 0) {
+  stop("No CNV h5ad files found in: ", cnv_output_dir)
+}
+
+cat("Found", length(cnv_h5ad_files), "CNV h5ad files\n")
+
+cnv_list <- list()
+for (h5ad_file in cnv_h5ad_files) {
+  sample_name <- basename(h5ad_file) %>% gsub("_cnv\\.h5ad$", "", .)
+  cat("  Processing:", sample_name, "\n")
+
+  adata <- read_h5ad(h5ad_file)
+  cell_barcodes <- rownames(adata$obs)
+  X_cnv <- adata$obsm$X_cnv
+  cnv_score_recalc <- calculate_cnv_score(X_cnv)
+
+  cnv_data <- data.frame(
+    cell_barcode = cell_barcodes,
+    cnv_score = cnv_score_recalc,
+    sample = sample_name,
+    stringsAsFactors = FALSE
+  )
+  cnv_list[[sample_name]] <- cnv_data
+
+  cat("    Cells:", nrow(cnv_data), "\n")
+}
+
+cnv_all <- bind_rows(cnv_list, .id = "sample_source")
+cnv_all$barcode_suffix <- cnv_all$cell_barcode
+
+cat("\nTotal CNV records:", nrow(cnv_all), "\n")
+cat("CNV score range:", round(min(cnv_all$cnv_score), 4), "-",
+    round(max(cnv_all$cnv_score), 4), "\n")
+```
+
+### Merge All Data Using Seurat's Coordinate System
+
+```{r merge-data}
+cat("\n=== Merging All Data with Seurat Coordinates ===\n")
+
+# Get Seurat metadata
+seurat_meta <- xenium@meta.data
+seurat_meta$cell_name <- rownames(seurat_meta)
+
+# Extract barcode suffix from Seurat cell names
+# Format: "Sample_FOV_barcode" -> extract "barcode"
+seurat_meta$barcode_suffix <- sapply(strsplit(rownames(seurat_meta), "_"),
+                                     function(x) x[length(x)])
+
+# Merge with CytoTRACE2 data
+cytotrace_df$cell_id <- rownames(cytotrace_df)
+cytotrace_df$barcode_suffix <- sapply(strsplit(cytotrace_df$cell_id, "_"),
+                                      function(x) x[length(x)])
+
+merged_df <- left_join(seurat_meta, cytotrace_df,
+                       by = "barcode_suffix", suffix = c("_seurat", "_cyto"))
+
+# Merge with CNV data
+merged_df <- left_join(merged_df, cnv_all, by = "barcode_suffix")
+
+# Add Seurat's spatial coordinates
+merged_df$x <- spatial_coords[match(merged_df$cell_name, spatial_coords$cell), "x"]
+merged_df$y <- spatial_coords[match(merged_df$cell_name, spatial_coords$cell), "y"]
+
+# Create Sample identifier from Seurat metadata for FOV matching
+if (!"Sample" %in% colnames(merged_df)) {
+  # Try to extract Sample from cell_name
+  merged_df$Sample <- sapply(strsplit(merged_df$cell_name, "_"), function(x) x[1])
+}
+
+# Filter to cells with CytoTRACE2 scores (CNV is optional - not all samples have it)
+plot_df <- merged_df[!is.na(merged_df$CytoTRACE2_Score), ]
+
+# Relabel cell types to match UMscAtlas majority_celltype_col palette
+# Map specific cell types to broader categories
+plot_df[[ct_col]] <- dplyr::case_match(
+  plot_df[[ct_col]],
+  # Epithelial cells
+  c("Cholangiocytes", "Hepatocytes") ~ "Epithelial cells",
+  # Endothelial cells (already has correct name in some cases)
+  c("Endothelial_cells", "endothelial cell", "capillary endothelial cell", "endothelial cell of artery",
+    "endothelial cell of vascular tree", "vein endothelial cell") ~ "Endothelial cells",
+  # Fibroblasts
+  c("fibroblast", "myofibroblast cell") ~ "Fibroblasts",
+  # Myeloid cells
+  c("Macrophages", "macrophage", "cycling macrophage", "Neutrophils", "Basophils",
+    "Granulocytes", "Mono_mono_derived_cells", "mast cell") ~ "Myeloid cells",
+  # B/Plasma cells
+  c("B_cells", "memory B cell", "Plasma_cells", "IgG plasma cell") ~ "B/Plasma cells",
+  # T/NK cells
+  c("T_cells", "CD4-positive helper T cell", "CD8-positive, alpha-beta regulatory T cell",
+    "CD4-positive, CD25-positive, CCR4-positive, alpha-beta regulatory T cell",
+    "effector memory CD4-positive, alpha-beta T cell", "effector memory CD8-positive, alpha-beta T cell",
+    "exhausted T cell", "cycling T cell", "naive T cell", "T follicular helper cell",
+    "Circulating_NK_NKT", "Resident_NK", "natural killer cell") ~ "T/NK cells",
+  # Dendritic cells (part of broader immune/myeloid)
+  c("cDC1s", "cDC2s", "Mig_cDCs", "pDCs", "conventional dendritic cell",
+    "myeloid dendritic cell", "plasmacytoid dendritic cell") ~ "Myeloid cells",
+  # Stromal cells
+  c("pericyte", "vascular associated smooth muscle cell", "cycling stromal cell") ~ "Mesenchymal cells",
+  # Melanoma (keep as is)
+  "Melanoma" ~ "Melanoma cells",
+  # Default: keep original name
+  .default = plot_df[[ct_col]]
+)
+
+cat("Cell type mapping applied:\n")
+cat("  Epithelial: Cholangiocytes, Hepatocytes\n")
+cat("  Endothelial: Various endothelial subtypes\n")
+cat("  Myeloid: Macrophages, Neutrophils, Basophils, DCs, etc.\n")
+cat("  B/Plasma: B cells, Plasma cells\n")
+cat("  T/NK: T cells, NK cells, regulatory T cells\n")
+cat("  Mesenchymal: Pericytes, smooth muscle, stromal\n")
+cat("  Fibroblasts: Fibroblast subtypes\n\n")
+
+cat("Seurat cells:", nrow(seurat_meta), "\n")
+cat("Cells with CytoTRACE2:", sum(!is.na(merged_df$CytoTRACE2_Score)), "\n")
+cat("Cells with CNV data:", sum(!is.na(merged_df$cnv_score)), "\n")
+cat("Cells in plot_df (have CytoTRACE2):", nrow(plot_df), "\n")
+cat("  - With both CytoTRACE2 and CNV:", sum(!is.na(plot_df$cnv_score)), "\n")
+cat("  - With CytoTRACE2 only:", sum(is.na(plot_df$cnv_score)), "\n")
+```
+
+## Unified 3-Panel Spatial Plots {.tabset}
+
+### Generate Plots for Each FOV
+
+```{r unified-plots, results='asis', fig.width=20, fig.height=7}
+cat("=== Generating Unified 3-Panel Spatial Plots ===\n\n")
+
+fov_names <- names(xenium@images)
+cat("Processing", length(fov_names), "FOVs\n\n")
+
+# Assign colors for cell types using UMscAtlas palette
+unique_cts <- sort(unique(plot_df[[ct_col]]))
+# Use majority_celltype_col for known types, fall back to gray for unmapped
+base_colors <- sapply(unique_cts, function(ct) {
+  if (ct %in% names(majority_celltype_col)) {
+    majority_celltype_col[ct]
+  } else {
+    "#E1E1E1FF"  # Gray for unmapped cell types
+  }
+})
+names(base_colors) <- unique_cts
+cat("Cell types:", paste(unique_cts, collapse = ", "), "\n")
+
+# Calculate global CytoTRACE2 max for consistent color scale
+cytotrace_max <- max(plot_df$CytoTRACE2_Score, na.rm = TRUE)
+cat("CytoTRACE2 score range: 0 -", round(cytotrace_max, 3), "\n\n")
+
+for (fov in fov_names) {
+  cat("###", fov, "\n\n")
+
+  # Get cells belonging to this FOV
+  fov_cells <- Cells(xenium@images[[fov]])
+
+  # Subset to FOV cells with complete data
+  fov_df <- plot_df[plot_df$cell_name %in% fov_cells, ]
+
+  if (nrow(fov_df) == 0) {
+    cat("No cells found for this FOV. Skipping.\n\n")
+    next
+  }
+
+  cat("Cells in FOV:", nrow(fov_df), "\n")
+  cat("  - With CNV data:", sum(!is.na(fov_df$cnv_score)), "\n")
+  cat("Coordinate ranges: x [", round(min(fov_df$x), 1), "-", round(max(fov_df$x), 1),
+      "], y [", round(min(fov_df$y), 1), "-", round(max(fov_df$y), 1), "]\n\n")
+
+  # Panel 1: Cell Types (order by cell type for consistent z-order)
+  p1 <- ggplot(fov_df, aes(x = x, y = y, color = .data[[ct_col]])) +
+    geom_point(size = 0.2, alpha = 0.8) +
+    scale_color_manual(values = base_colors, name = "Cell Type") +
+    coord_fixed() +
+    theme_minimal() +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(size = 12, face = "bold", hjust = 0.5)
+    ) +
+    guides(color = guide_legend(override.aes = list(size = 4))) +
+    labs(title = paste("Cell Types -", fov), x = "X", y = "Y")
+
+  # Panel 2: CytoTRACE2 Score (highest values on top)
+  fov_df_ct2 <- fov_df[order(fov_df$CytoTRACE2_Score, decreasing = FALSE), ]
+  p2 <- ggplot(fov_df_ct2, aes(x = x, y = y, color = CytoTRACE2_Score)) +
+    geom_point(size = 0.2, alpha = 0.8) +
+    scale_color_gradientn(
+      colours = cytotrace_colors,
+      limits = c(0, cytotrace_max),
+      name = "CytoTRACE2\nScore"
+    ) +
+    coord_fixed() +
+    theme_minimal() +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(size = 12, face = "bold", hjust = 0.5)
+    ) +
+    labs(title = paste("CytoTRACE2 Score -", fov), x = "X", y = "Y")
+
+  # Panel 3: CNV Score (highest values on top)
+  # Check if there's any CNV data for this FOV
+  has_cnv <- sum(!is.na(fov_df$cnv_score)) > 0
+
+  if (has_cnv) {
+    fov_df_cnv <- fov_df[!is.na(fov_df$cnv_score), ]
+    fov_df_cnv <- fov_df_cnv[order(fov_df_cnv$cnv_score, decreasing = FALSE), ]
+    p3 <- ggplot(fov_df_cnv, aes(x = x, y = y, color = cnv_score)) +
+      geom_point(size = 0.2, alpha = 0.8) +
+      scale_color_viridis_c(
+        option = "viridis",
+        name = "CNV\nScore"
+      ) +
+      coord_fixed() +
+      theme_minimal() +
+      theme(
+        legend.position = "right",
+        plot.title = element_text(size = 12, face = "bold", hjust = 0.5)
+      ) +
+      labs(title = paste("CNV Score -", fov), x = "X", y = "Y")
+  } else {
+    # No CNV data - create placeholder plot
+    p3 <- ggplot(fov_df, aes(x = x, y = y)) +
+      geom_point(size = 0.2, alpha = 0.3, color = "gray80") +
+      coord_fixed() +
+      theme_minimal() +
+      theme(
+        legend.position = "right",
+        plot.title = element_text(size = 12, face = "bold", hjust = 0.5)
+      ) +
+      labs(title = paste("CNV Score -", fov), x = "X", y = "Y",
+           subtitle = "No CNV data available") +
+      annotate("text", x = mean(range(fov_df$x)), y = mean(range(fov_df$y)),
+               label = "No CNV data\nfor this sample", size = 6, color = "gray50")
+  }
+
+  # Combine using patchwork
+  p_combined <- p1 | p2 | p3
+  print(p_combined)
+
+  # Save high-resolution PNG (white background)
+  safe_name <- gsub("[^a-zA-Z0-9_-]", "_", fov)
+  output_file <- file.path(output_dir, paste0("spatial_3panel_", safe_name, ".png"))
+  ggsave(output_file, p_combined, width = 20, height = 7, dpi = 300, bg = "white")
+  cat("\nSaved:", output_file, "\n")
+
+  # Create black background versions
+  dark_theme <- theme(
+    plot.background = element_rect(fill = "black", color = NA),
+    panel.background = element_rect(fill = "black", color = NA),
+    panel.grid.major = element_line(color = "grey20", linewidth = 0.2),
+    panel.grid.minor = element_blank(),
+    text = element_text(color = "white"),
+    axis.text = element_text(color = "white"),
+    axis.title = element_text(color = "white"),
+    plot.title = element_text(color = "white", size = 12, face = "bold", hjust = 0.5),
+    legend.background = element_rect(fill = "black", color = NA),
+    legend.text = element_text(color = "white"),
+    legend.title = element_text(color = "white"),
+    legend.position = "right"
+  )
+
+  # Panel 1: Cell Types (black background)
+  p1_black <- ggplot(fov_df, aes(x = x, y = y, color = .data[[ct_col]])) +
+    geom_point(size = 0.2, alpha = 0.8) +
+    scale_color_manual(values = base_colors, name = "Cell Type") +
+    coord_fixed() +
+    theme_minimal() +
+    dark_theme +
+    guides(color = guide_legend(override.aes = list(size = 4))) +
+    labs(title = paste("Cell Types -", fov), x = "X", y = "Y")
+
+  # Panel 2: CytoTRACE2 (black background)
+  p2_black <- ggplot(fov_df_ct2, aes(x = x, y = y, color = CytoTRACE2_Score)) +
+    geom_point(size = 0.2, alpha = 0.8) +
+    scale_color_gradientn(
+      colours = cytotrace_colors,
+      limits = c(0, cytotrace_max),
+      name = "CytoTRACE2\nScore"
+    ) +
+    coord_fixed() +
+    theme_minimal() +
+    dark_theme +
+    labs(title = paste("CytoTRACE2 Score -", fov), x = "X", y = "Y")
+
+  # Panel 3: CNV Score (black background)
+  if (has_cnv) {
+    p3_black <- ggplot(fov_df_cnv, aes(x = x, y = y, color = cnv_score)) +
+      geom_point(size = 0.2, alpha = 0.8) +
+      scale_color_viridis_c(
+        option = "viridis",
+        name = "CNV\nScore"
+      ) +
+      coord_fixed() +
+      theme_minimal() +
+      dark_theme +
+      labs(title = paste("CNV Score -", fov), x = "X", y = "Y")
+  } else {
+    # No CNV data - create placeholder plot (black background)
+    p3_black <- ggplot(fov_df, aes(x = x, y = y)) +
+      geom_point(size = 0.2, alpha = 0.3, color = "gray30") +
+      coord_fixed() +
+      theme_minimal() +
+      dark_theme +
+      labs(title = paste("CNV Score -", fov), x = "X", y = "Y",
+           subtitle = "No CNV data available") +
+      annotate("text", x = mean(range(fov_df$x)), y = mean(range(fov_df$y)),
+               label = "No CNV data\nfor this sample", size = 6, color = "gray60")
+  }
+
+  # Combine and save black background version
+  p_combined_black <- p1_black | p2_black | p3_black
+  output_file_black <- file.path(output_dir, paste0("spatial_3panel_", safe_name, "_black.png"))
+  ggsave(output_file_black, p_combined_black, width = 20, height = 7, dpi = 300, bg = "black")
+  cat("Saved (black):", output_file_black, "\n\n")
+}
+
+cat("\n=== All Plots Generated ===\n")
+```
+
+### Combined Overview (All FOVs)
+
+```{r combined-overview, fig.width=24, fig.height=16}
+cat("\n=== Creating Combined Overview ===\n")
+
+# For each FOV, create a simplified plot for overview
+overview_plots <- list()
+
+for (fov in fov_names) {
+  fov_cells <- Cells(xenium@images[[fov]])
+  fov_df <- plot_df[plot_df$cell_name %in% fov_cells, ]
+
+  if (nrow(fov_df) == 0) next
+
+  # Single panel showing CytoTRACE2 (highest values on top)
+  fov_df_ov <- fov_df[order(fov_df$CytoTRACE2_Score, decreasing = FALSE), ]
+  p <- ggplot(fov_df_ov, aes(x = x, y = y, color = CytoTRACE2_Score)) +
+    geom_point(size = 0.15, alpha = 0.8) +
+    scale_color_gradientn(colours = cytotrace_colors, limits = c(0, cytotrace_max)) +
+    coord_fixed() +
+    theme_minimal() +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 10, face = "bold")
+    ) +
+    labs(title = fov, x = NULL, y = NULL)
+
+  overview_plots[[fov]] <- p
+}
+
+if (length(overview_plots) > 0) {
+  p_overview <- wrap_plots(overview_plots, ncol = 3)
+  print(p_overview)
+
+  ggsave(file.path(output_dir, "spatial_overview_all_fovs.png"),
+         p_overview, width = 24, height = ceiling(length(overview_plots) / 3) * 8,
+         dpi = 300, bg = "white")
+}
+
+# Create black background overview
+overview_plots_black <- list()
+
+for (fov in fov_names) {
+  fov_cells <- Cells(xenium@images[[fov]])
+  fov_df <- plot_df[plot_df$cell_name %in% fov_cells, ]
+
+  if (nrow(fov_df) == 0) next
+
+  # Single panel showing CytoTRACE2 (black background)
+  fov_df_ov <- fov_df[order(fov_df$CytoTRACE2_Score, decreasing = FALSE), ]
+  p_black <- ggplot(fov_df_ov, aes(x = x, y = y, color = CytoTRACE2_Score)) +
+    geom_point(size = 0.15, alpha = 0.8) +
+    scale_color_gradientn(colours = cytotrace_colors, limits = c(0, cytotrace_max)) +
+    coord_fixed() +
+    theme_minimal() +
+    theme(
+      plot.background = element_rect(fill = "black", color = NA),
+      panel.background = element_rect(fill = "black", color = NA),
+      panel.grid.major = element_line(color = "grey20", linewidth = 0.2),
+      panel.grid.minor = element_blank(),
+      text = element_text(color = "white"),
+      axis.text = element_text(color = "white"),
+      plot.title = element_text(color = "white", size = 10, face = "bold"),
+      legend.position = "none"
+    ) +
+    labs(title = fov, x = NULL, y = NULL)
+
+  overview_plots_black[[fov]] <- p_black
+}
+
+if (length(overview_plots_black) > 0) {
+  p_overview_black <- wrap_plots(overview_plots_black, ncol = 3)
+
+  ggsave(file.path(output_dir, "spatial_overview_all_fovs_black.png"),
+         p_overview_black, width = 24, height = ceiling(length(overview_plots_black) / 3) * 8,
+         dpi = 300, bg = "black")
+  cat("Saved black background overview\n")
+}
+```
+
+## Summary {.tabset}
+
+### Data Summary
+
+```{r data-summary}
+cat("=== Analysis Summary ===\n\n")
+cat("Completed at:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+
+cat("Dataset: Boston Sullivan cohort (Xenium)\n")
+cat("  Total cells in Seurat object:", ncol(xenium), "\n")
+cat("  Cells with BOTH CytoTRACE2 and CNV data:", nrow(plot_df), "\n")
+cat("  Merge rate:", round(nrow(plot_df) / ncol(xenium) * 100, 1), "%\n")
+cat("  FOVs:", length(fov_names), "\n")
+cat("  Cell types:", length(unique(plot_df[[ct_col]])), "\n\n")
+
+cat("Score ranges:\n")
+cat("  CytoTRACE2_Score:", round(min(plot_df$CytoTRACE2_Score), 3), "-",
+    round(max(plot_df$CytoTRACE2_Score), 3), "\n")
+cat("  CNV score:", round(min(plot_df$cnv_score), 4), "-",
+    round(max(plot_df$cnv_score), 4), "\n\n")
+
+cat("Output files:\n")
+output_files <- list.files(output_dir, pattern = "\\.png$")
+cat("  PNG files:", length(output_files), "\n")
+for (f in output_files) {
+  cat("   -", f, "\n")
+}
+```
+
+### Export Combined Data
+
+```{r export-data}
+cat("\n=== Exporting Combined Data ===\n")
+
+# Export the merged dataframe with Seurat coordinates
+export_cols <- c("cell_name", ct_col, "CytoTRACE2_Score", "CytoTRACE2_Top",
+                 "CytoTRACE2_Bottom", "cnv_score", "x", "y", "barcode_suffix", "Sample")
+export_cols <- export_cols[export_cols %in% colnames(plot_df)]
+
+export_df <- plot_df[, export_cols, drop = FALSE]
+output_csv <- file.path(output_dir, "unified_spatial_data_boston.csv")
+write.csv(export_df, output_csv, row.names = FALSE)
+
+cat("Exported:", output_csv, "\n")
+cat("  Rows:", nrow(export_df), "\n")
+cat("  Columns:", ncol(export_df), "\n")
+```
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```

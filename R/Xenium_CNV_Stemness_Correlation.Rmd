@@ -1,0 +1,781 @@
+---
+title: "p31662 - Boston Cohort - CytoTRACE vs CNV Correlation Analysis"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package="ezRun", lib.loc=.libPaths())
+    css: !expr system.file("templates/fgcz.css", package="ezRun", lib.loc=.libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r script-info, include=FALSE}
+# This script was used to create the following figures:
+# Figure 5 (per-sample CNV vs stemness correlation on the Boston Xenium cohort)
+```
+
+#  {.tabset}
+
+## Overview
+
+Started on `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`
+
+This analysis correlates CytoTRACE2 stemness scores with Copy Number Variation (CNV) patterns
+in the Boston Sullivan Xenium cohort from the p36005 Uveal Melanoma project.
+
+**Key Questions:**
+1. Does high CytoTRACE stemness correlate with specific CNV subclones?
+2. Which chromosomal indels (gains/losses) are associated with stemness?
+3. Is there spatial colocalization of high-stemness cells with specific CNV patterns?
+
+**Data Sources:**
+- CytoTRACE2 scores: p31662 (UM Atlas) - 14_Xenium_Stemness_Validation.Rmd
+- CNV scores: p36005 (Egle's project) - 06_InSituCNV_Analysis.Rmd
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 14, fig.height = 10)
+
+# Load required libraries
+library(Seurat)
+library(qs2)
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(pals)
+library(ggpubr)
+library(viridis)
+
+# Set paths
+p31662_dir <- ".."
+p36005_dir <- "../Xenium_Boston_Sullivan"
+
+# Output directory
+output_dir <- file.path(p31662_dir, "Outputs/CytoTRACE_CNV_Correlation/")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+cat("=== Analysis Setup ===\n")
+cat("p31662 Atlas directory:", p31662_dir, "\n")
+cat("p36005 Boston directory:", p36005_dir, "\n")
+cat("Output directory:", output_dir, "\n\n")
+```
+
+## Load Data {.tabset}
+
+### Load CytoTRACE data
+```{r load-cytotrace}
+cat("=== Loading CytoTRACE2 Data ===\n")
+
+# Load Seurat object with Stemness_UCell scores (always positive, 0-1 range)
+seurat_file <- file.path(p31662_dir, "Outputs/Xenium_Stemness/xenium_Boston_Sullivan_with_scores.qs2")
+xenium_obj <- qs_read(seurat_file, nthreads = 8)
+
+cat("Loaded Seurat object:", ncol(xenium_obj), "cells\n")
+cat("  Samples:", paste(unique(xenium_obj$orig.ident), collapse = ", "), "\n")
+
+# Extract metadata with UCell stemness scores
+cytotrace_df <- xenium_obj@meta.data %>%
+  tibble::rownames_to_column("cell_id") %>%
+  select(cell_id, Sample = orig.ident, CellType_Clean, Stemness_UCell) %>%
+  mutate(barcode_suffix = sapply(strsplit(cell_id, "_"), function(x) x[length(x)]))
+
+# Recompute stemness_category based on Stemness_UCell tertiles
+stemness_tertiles <- quantile(cytotrace_df$Stemness_UCell, probs = c(1/3, 2/3), na.rm = TRUE)
+cytotrace_df <- cytotrace_df %>%
+  mutate(stemness_category = case_when(
+    Stemness_UCell <= stemness_tertiles[1] ~ "Low",
+    Stemness_UCell <= stemness_tertiles[2] ~ "Medium",
+    TRUE ~ "High"
+  ))
+
+cat("Extracted metadata:", nrow(cytotrace_df), "cells\n")
+cat("  Stemness_UCell range:", round(min(cytotrace_df$Stemness_UCell, na.rm = TRUE), 3), "-",
+    round(max(cytotrace_df$Stemness_UCell, na.rm = TRUE), 3), "\n")
+cat("  Stemness tertiles (Low/Medium/High cutoffs):",
+    round(stemness_tertiles[1], 4), ",", round(stemness_tertiles[2], 4), "\n")
+cat("  Stemness categories:", paste(names(table(cytotrace_df$stemness_category)),
+    table(cytotrace_df$stemness_category), collapse = ", "), "\n")
+```
+
+### Load CNV data from h5ad files (recalculate from X_cnv matrix)
+```{r load-cnv}
+cat("\n=== Loading CNV Data from h5ad files ===\n")
+
+# The CSV cnv_score is incorrect (constant values). Need to recalculate from X_cnv matrix.
+library(anndataR)
+
+cnv_output_dir <- file.path(p36005_dir, "06_InSituCNV_Outputs")
+cnv_h5ad_files <- list.files(cnv_output_dir, pattern = "_cnv\\.h5ad$", full.names = TRUE)
+
+cat("Found", length(cnv_h5ad_files), "CNV h5ad files\n")
+
+# Function to calculate CNV score from X_cnv matrix
+# Using RMS (root mean square) of CNV values as overall CNV burden
+calculate_cnv_score <- function(X_cnv) {
+  # Convert to matrix if needed
+  if (inherits(X_cnv, "dgRMatrix") || inherits(X_cnv, "dgCMatrix")) {
+    X_mat <- as.matrix(X_cnv)
+  } else {
+    X_mat <- as(X_cnv, "matrix")
+  }
+  # Calculate RMS of each row (cell) - represents overall CNV deviation
+  sqrt(rowMeans(X_mat^2))
+}
+
+cnv_list <- list()
+for (h5ad_file in cnv_h5ad_files) {
+  sample_name <- basename(h5ad_file) %>% gsub("_cnv\\.h5ad$", "", .)
+  cat("  Processing:", sample_name, "\n")
+
+  # Load h5ad file
+  adata <- read_h5ad(h5ad_file)
+
+  # Get cell barcodes
+  cell_barcodes <- rownames(adata$obs)
+
+  # Recalculate CNV score from X_cnv matrix
+  X_cnv <- adata$obsm$X_cnv
+  cnv_score_recalc <- calculate_cnv_score(X_cnv)
+
+  # Get other metadata
+  cnv_data <- data.frame(
+    cell_type = adata$obs$cell_type,
+    cnv_score = cnv_score_recalc,
+    x_centroid = adata$obs$x_centroid,
+    y_centroid = adata$obs$y_centroid,
+    sample = sample_name,
+    row.names = cell_barcodes
+  )
+
+  cnv_list[[sample_name]] <- cnv_data
+
+  cat("    Cells:", nrow(cnv_data), "\n")
+  cat("    CNV score range:", round(min(cnv_score_recalc), 4), "-",
+      round(max(cnv_score_recalc), 4), "\n")
+}
+
+cnv_all <- bind_rows(cnv_list, .id = "sample_source")
+cat("\nTotal CNV records:", nrow(cnv_all), "\n")
+cat("Recalculated CNV score summary:\n")
+print(summary(cnv_all$cnv_score))
+```
+
+### Merge datasets
+```{r merge-datasets}
+cat("\n=== Merging Datasets ===\n")
+
+# The CNV data has cell barcodes as rownames (e.g., "aaaaihba-1")
+# The cytotrace_df has full cell IDs (e.g., "S22-19XXX-A1_Slide12_aaaaihba-1")
+# Strategy: barcode_suffix already extracted in previous chunk
+
+cnv_all$barcode_suffix <- rownames(cnv_all)
+
+# Merge by barcode suffix
+merged_df <- left_join(cytotrace_df, cnv_all,
+                       by = "barcode_suffix",
+                       suffix = c("_cyto", "_cnv"))
+
+cat("Merge results:\n")
+cat("  Stemness (UCell) cells:", nrow(cytotrace_df), "\n")
+cat("  CNV records:", nrow(cnv_all), "\n")
+cat("  Merged cells with CNV data:", sum(!is.na(merged_df$cnv_score)), "\n")
+
+# Create analysis dataframe with complete cases
+analysis_df <- merged_df %>%
+  filter(!is.na(Stemness_UCell), !is.na(cnv_score))
+
+cat("  Cells with BOTH scores:", nrow(analysis_df), "\n")
+
+# Order stemness_category factor correctly
+analysis_df$stemness_category <- factor(analysis_df$stemness_category,
+                                         levels = c("Low", "Medium", "High"))
+
+# Display score ranges
+cat("\nScore ranges:\n")
+cat("  Stemness_UCell (CytoTRACE2 signature):", round(min(analysis_df$Stemness_UCell), 3), "-",
+    round(max(analysis_df$Stemness_UCell), 3), "\n")
+cat("  CNV score (recalculated RMS):", round(min(analysis_df$cnv_score), 4), "-",
+    round(max(analysis_df$cnv_score), 4), "\n")
+
+# Check sample distribution
+cat("\nSamples in analysis:\n")
+print(table(analysis_df$Sample))
+```
+
+## Data Summary {.tabset}
+
+### Summary statistics
+```{r summary-stats}
+cat("=== Data Summary ===\n\n")
+
+# By sample
+sample_summary <- analysis_df %>%
+  group_by(sample) %>%
+  summarise(
+    n_cells = n(),
+    mean_stemness = mean(Stemness_UCell),
+    median_stemness = median(Stemness_UCell),
+    mean_cnv = mean(cnv_score),
+    median_cnv = median(cnv_score),
+    .groups = "drop"
+  )
+
+print(sample_summary)
+
+# By stemness category
+stem_summary <- analysis_df %>%
+  group_by(stemness_category) %>%
+  summarise(
+    n_cells = n(),
+    mean_cnv = mean(cnv_score),
+    median_cnv = median(cnv_score),
+    sd_cnv = sd(cnv_score),
+    .groups = "drop"
+  ) %>%
+  arrange(stemness_category)
+
+cat("\nBy stemness category:\n")
+print(stem_summary)
+```
+
+## Correlation Analysis {.tabset}
+
+### Scatter plot: Stemness vs CNV score
+```{r scatter-stemness-cnv, fig.width=14, fig.height=10}
+# Overall correlation
+p_overall <- ggplot(analysis_df, aes(x = Stemness_UCell, y = cnv_score)) +
+  geom_point(alpha = 0.2, size = 0.8, color = "darkgray") +
+  geom_smooth(method = "lm", color = "red", se = TRUE, linewidth = 1) +
+  stat_cor(method = "pearson", label.x.npc = 0.05, label.y.npc = 0.95,
+           aes(label = ..r.label..), size = 5) +
+  stat_cor(method = "spearman", label.x.npc = 0.05, label.y.npc = 0.85,
+           aes(label = ..r.label..), size = 4) +
+  theme_minimal() +
+  labs(title = "All Cells: CytoTRACE2 Stemness (UCell) vs CNV Score",
+       x = "Stemness Score (CytoTRACE2 UCell)",
+       y = "CNV Score (RMS)")
+
+print(p_overall)
+ggsave(file.path(output_dir, "scatter_stemness_vs_cnv_overall.png"),
+       p_overall, width = 10, height = 8, dpi = 300, bg = "white")
+
+# By sample
+p_by_sample <- ggplot(analysis_df, aes(x = Stemness_UCell, y = cnv_score, color = sample)) +
+  geom_point(alpha = 0.3, size = 0.8) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+  facet_wrap(~sample, scales = "free", ncol = 3) +
+  stat_cor(method = "pearson", label.x.npc = 0.05, label.y.npc = 0.95, size = 3.5) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(title = "All Cells: CytoTRACE2 Stemness (UCell) vs CNV Score by Sample",
+       x = "Stemness Score (CytoTRACE2 UCell)",
+       y = "CNV Score (RMS)",
+       color = "Sample")
+
+print(p_by_sample)
+ggsave(file.path(output_dir, "scatter_stemness_vs_cnv_by_sample.png"),
+       p_by_sample, width = 14, height = 10, dpi = 300, bg = "white")
+
+# Calculate correlation statistics
+cat("\n=== Correlation Statistics ===\n")
+cor_pearson <- cor(analysis_df$Stemness_UCell, analysis_df$cnv_score, method = "pearson")
+cor_spearman <- cor(analysis_df$Stemness_UCell, analysis_df$cnv_score, method = "spearman")
+
+cat("Pearson correlation:", round(cor_pearson, 4), "\n")
+cat("Spearman correlation:", round(cor_spearman, 4), "\n")
+
+cor_test <- cor.test(analysis_df$Stemness_UCell, analysis_df$cnv_score, method = "pearson")
+cat("p-value:", format(cor_test$p.value, scientific = TRUE), "\n")
+
+# By sample correlations
+cat("\nBy sample:\n")
+by_sample_cor <- analysis_df %>%
+  group_by(sample) %>%
+  summarise(
+    n = n(),
+    pearson_r = cor(Stemness_UCell, cnv_score, use = "complete.obs"),
+    p_value = cor.test(Stemness_UCell, cnv_score)$p.value,
+    .groups = "drop"
+  )
+print(by_sample_cor)
+```
+
+### Stemness categories vs CNV categories
+```{r stemness-categories-cnv, fig.width=14, fig.height=10}
+# Create CNV categories (high/low based on median)
+cnv_median <- median(analysis_df$cnv_score)
+analysis_df$cnv_category <- ifelse(analysis_df$cnv_score > cnv_median, "High_CNV", "Low_CNV")
+
+# Contingency table
+contingency <- table(stemness = analysis_df$stemness_category,
+                     cnv = analysis_df$cnv_category)
+
+cat("=== Stemness Category vs CNV Category ===\n")
+print(contingency)
+
+# Chi-square test
+chi_test <- chisq.test(contingency)
+cat("\nChi-square test:\n")
+cat("  X-squared:", round(chi_test$statistic, 4), "\n")
+cat("  p-value:", format(chi_test$p.value, scientific = TRUE), "\n")
+
+# Bar plot
+contingency_df <- as.data.frame(contingency)
+colnames(contingency_df) <- c("Stemness", "CNV", "Count")
+
+p_bar <- ggplot(contingency_df, aes(x = Stemness, y = Count, fill = CNV)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = Count), position = position_dodge(width = 0.9),
+            vjust = -0.25, size = 4) +
+  scale_fill_manual(values = c("Low_CNV" = "#2c7bb6", "High_CNV" = "#d7191c")) +
+  theme_minimal() +
+  labs(title = "Stemness Category vs CNV Category",
+       x = "Stemness Category (CytoTRACE2)",
+       y = "Number of Cells",
+       fill = "CNV Category")
+
+print(p_bar)
+ggsave(file.path(output_dir, "bar_stemness_vs_cnv_category.png"),
+       p_bar, width = 10, height = 8, dpi = 300, bg = "white")
+
+# Box plot: CNV score by stemness category
+p_box <- ggplot(analysis_df, aes(x = stemness_category, y = cnv_score, fill = stemness_category)) +
+  geom_boxplot(outlier.size = 0.5, alpha = 0.8) +
+  geom_violin(alpha = 0.3) +
+  scale_fill_manual(values = c("Low" = "#2166AC", "Medium" = "#999999", "High" = "#B2182B")) +
+  stat_compare_means(method = "kruskal.test", label.y.npc = 0.95) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "CNV Score Distribution by Stemness Category",
+       x = "Stemness Category (CytoTRACE2)",
+       y = "CNV Score")
+
+print(p_box)
+ggsave(file.path(output_dir, "boxplot_cnv_by_stemness_category.png"),
+       p_box, width = 10, height = 8, dpi = 300, bg = "white")
+```
+
+### Kruskal-Wallis test and pairwise comparisons
+```{r pairwise-tests}
+cat("\n=== Pairwise Comparisons ===\n")
+
+# Kruskal-Wallis test
+kw_test <- kruskal.test(cnv_score ~ stemness_category, data = analysis_df)
+cat("Kruskal-Wallis test:\n")
+cat("  chi-squared:", round(kw_test$statistic, 4), "\n")
+cat("  p-value:", format(kw_test$p.value, scientific = TRUE), "\n")
+
+# Pairwise Wilcoxon tests
+pairwise_test <- pairwise.wilcox.test(analysis_df$cnv_score,
+                                      analysis_df$stemness_category,
+                                      p.adjust.method = "BH")
+cat("\nPairwise Wilcoxon tests (BH adjusted):\n")
+print(pairwise_test$p.value)
+```
+
+## Cell Type Analysis {.tabset}
+
+### Stemness and CNV by cell type
+```{r celltype-analysis}
+cat("\n=== Analysis by Cell Type ===\n\n")
+
+# Summary by cell type
+celltype_summary <- analysis_df %>%
+  group_by(CellType_Clean) %>%
+  summarise(
+    n_cells = n(),
+    mean_stemness = mean(Stemness_UCell),
+    median_stemness = median(Stemness_UCell),
+    mean_cnv = mean(cnv_score),
+    median_cnv = median(cnv_score),
+    pct_high_stemness = sum(stemness_category == "High") / n() * 100,
+    pct_high_cnv = sum(cnv_category == "High_CNV") / n() * 100,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_stemness))
+
+print(celltype_summary)
+
+# Calculate standard error for each cell type
+celltype_se <- analysis_df %>%
+  group_by(CellType_Clean) %>%
+  summarise(
+    se_stemness = sd(Stemness_UCell) / sqrt(n()),
+    .groups = "drop"
+  )
+
+# Add SE to summary
+celltype_summary <- celltype_summary %>%
+  left_join(celltype_se, by = "CellType_Clean")
+
+# Plot: Stemness by cell type
+p_cell_stem <- ggplot(celltype_summary, aes(x = reorder(CellType_Clean, mean_stemness), y = mean_stemness)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_errorbar(aes(ymin = mean_stemness - se_stemness, ymax = mean_stemness + se_stemness),
+                width = 0.2) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Mean Stemness Score by Cell Type",
+       x = "Cell Type",
+       y = "Mean CytoTRACE2 Stemness Score")
+
+print(p_cell_stem)
+ggsave(file.path(output_dir, "barplot_stemness_by_celltype.png"),
+       p_cell_stem, width = 12, height = 8, dpi = 300, bg = "white")
+
+# Plot: CNV by cell type
+p_cell_cnv <- ggplot(celltype_summary, aes(x = reorder(CellType_Clean, mean_cnv), y = mean_cnv)) +
+  geom_bar(stat = "identity", fill = "coral") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Mean CNV Score by Cell Type",
+       x = "Cell Type",
+       y = "Mean CNV Score")
+
+print(p_cell_cnv)
+ggsave(file.path(output_dir, "barplot_cnv_by_celltype.png"),
+       p_cell_cnv, width = 12, height = 8, dpi = 300, bg = "white")
+```
+
+### Melanoma cells: High stemness vs High CNV
+```{r melanoma-analysis}
+# Focus on melanoma cells
+melanoma_df <- analysis_df %>%
+  filter(grepl("melanoma|Melanoma|tumor|Tumor", CellType_Clean, ignore.case = TRUE))
+
+if (nrow(melanoma_df) > 50) {
+  cat("\n=== Melanoma Cell Analysis ===\n")
+  cat("Melanoma cells:", nrow(melanoma_df), "\n")
+
+  # Overlap analysis
+  high_stem <- melanoma_df$stemness_category == "High"
+  high_cnv <- melanoma_df$cnv_category == "High_CNV"
+
+  both_high <- sum(high_stem & high_cnv)
+  stem_high_cnv_low <- sum(high_stem & !high_cnv)
+  stem_low_cnv_high <- sum(!high_stem & high_cnv)
+
+  cat("\nMelanoma cell overlaps:\n")
+  cat("  High stemness + High CNV:", both_high, "\n")
+  cat("  High stemness + Low CNV:", stem_high_cnv_low, "\n")
+  cat("  Low stemness + High CNV:", stem_low_cnv_high, "\n")
+
+  # Expected vs observed for high stemness + high CNV
+  if (both_high > 0) {
+    pct_high_stem <- sum(high_stem) / nrow(melanoma_df) * 100
+    pct_high_cnv <- sum(high_cnv) / nrow(melanoma_df) * 100
+    pct_both <- both_high / nrow(melanoma_df) * 100
+    expected_pct <- pct_high_stem * pct_high_cnv / 100
+
+    cat("\nExpected overlap (if independent):", round(expected_pct, 1), "%\n")
+    cat("Observed overlap:", round(pct_both, 1), "%\n")
+    cat("Fold enrichment:", round(pct_both / expected_pct, 2), "\n")
+  }
+}
+```
+
+### Scatter plots: Melanoma cells only
+```{r melanoma-scatter-plots, fig.width=14, fig.height=10}
+# Check if enough melanoma cells exist
+if (nrow(melanoma_df) > 50) {
+  cat("\n=== Melanoma Cell Scatter Plots ===\n")
+  cat("Total melanoma cells:", nrow(melanoma_df), "\n")
+
+  # 1. Overall melanoma correlation plot
+  p_melanoma_overall <- ggplot(melanoma_df, aes(x = Stemness_UCell, y = cnv_score)) +
+    geom_point(alpha = 0.2, size = 0.8, color = "darkgray") +
+    geom_smooth(method = "lm", color = "red", se = TRUE, linewidth = 1) +
+    stat_cor(method = "pearson", label.x.npc = 0.05, label.y.npc = 0.95,
+             aes(label = ..r.label..), size = 5) +
+    stat_cor(method = "spearman", label.x.npc = 0.05, label.y.npc = 0.85,
+             aes(label = ..r.label..), size = 4) +
+    theme_minimal() +
+    labs(title = "MELANOMA CELLS ONLY: CytoTRACE2 Stemness (UCell) vs CNV Score",
+         x = "Stemness Score (CytoTRACE2 UCell)",
+         y = "CNV Score (RMS)")
+
+  print(p_melanoma_overall)
+  ggsave(file.path(output_dir, "scatter_stemness_vs_cnv_melanoma_overall.png"),
+         p_melanoma_overall, width = 10, height = 8, dpi = 300, bg = "white")
+
+  # 2. By-sample melanoma correlation plots
+  p_melanoma_by_sample <- ggplot(melanoma_df, aes(x = Stemness_UCell, y = cnv_score, color = sample)) +
+    geom_point(alpha = 0.3, size = 0.8) +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.8) +
+    facet_wrap(~sample, scales = "free", ncol = 3) +
+    stat_cor(method = "pearson", label.x.npc = 0.05, label.y.npc = 0.95, size = 3.5) +
+    theme_minimal() +
+    theme(legend.position = "bottom") +
+    labs(title = "MELANOMA CELLS ONLY: CytoTRACE2 Stemness (UCell) vs CNV Score by Sample",
+         x = "Stemness Score (CytoTRACE2 UCell)",
+         y = "CNV Score (RMS)",
+         color = "Sample")
+
+  print(p_melanoma_by_sample)
+  ggsave(file.path(output_dir, "scatter_stemness_vs_cnv_melanoma_by_sample.png"),
+         p_melanoma_by_sample, width = 14, height = 10, dpi = 300, bg = "white")
+
+  # 3. Correlation statistics for melanoma cells
+  cat("\n=== Melanoma Cell Correlation Statistics ===\n")
+  cor_pearson_mel <- cor(melanoma_df$Stemness_UCell, melanoma_df$cnv_score, method = "pearson")
+  cor_spearman_mel <- cor(melanoma_df$Stemness_UCell, melanoma_df$cnv_score, method = "spearman")
+
+  cat("Overall (melanoma cells only):\n")
+  cat("  Pearson correlation:", round(cor_pearson_mel, 4), "\n")
+  cat("  Spearman correlation:", round(cor_spearman_mel, 4), "\n")
+
+  cor_test_mel <- cor.test(melanoma_df$Stemness_UCell, melanoma_df$cnv_score, method = "pearson")
+  cat("  p-value:", format(cor_test_mel$p.value, scientific = TRUE), "\n")
+
+  # By sample correlations for melanoma cells
+  cat("\nBy sample (melanoma cells only):\n")
+  by_sample_cor_mel <- melanoma_df %>%
+    group_by(sample) %>%
+    summarise(
+      n_melanoma = n(),
+      pearson_r = cor(Stemness_UCell, cnv_score, use = "complete.obs"),
+      p_value = cor.test(Stemness_UCell, cnv_score)$p.value,
+      .groups = "drop"
+    )
+  print(by_sample_cor_mel)
+
+} else {
+  cat("Not enough melanoma cells for scatter plots (n =", nrow(melanoma_df), ")\n")
+}
+```
+
+## Spatial Analysis {.tabset}
+
+### Spatial plots: Stemness and CNV
+```{r spatial-plots, fig.width=18, fig.height=6}
+cat("\n=== Generating Spatial Plots ===\n")
+
+# Check if we have coordinates
+if (all(c("x_centroid", "y_centroid") %in% colnames(analysis_df))) {
+  cat("Spatial coordinates available. Generating plots...\n")
+
+  # Get unique samples
+  samples <- unique(analysis_df$sample)
+
+  for (sample_name in samples) {
+    cat("\nSample:", sample_name, "\n")
+
+    sample_df <- analysis_df %>%
+      filter(sample == sample_name)
+
+    # Stemness score spatial plot
+    p1 <- ggplot(sample_df, aes(x = x_centroid, y = y_centroid, color = Stemness_UCell)) +
+      geom_point(size = 0.5, alpha = 0.7) +
+      scale_color_viridis_c(option = "magma", name = "Stemness") +
+      coord_fixed() +
+      theme_minimal() +
+      theme(legend.position = "right") +
+      labs(title = paste("CytoTRACE2 Stemness -", sample_name),
+           x = "X (microns)", y = "Y (microns)")
+
+    # CNV score spatial plot
+    p2 <- ggplot(sample_df, aes(x = x_centroid, y = y_centroid, color = cnv_score)) +
+      geom_point(size = 0.5, alpha = 0.7) +
+      scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                           midpoint = median(sample_df$cnv_score, na.rm = TRUE),
+                           name = "CNV") +
+      coord_fixed() +
+      theme_minimal() +
+      theme(legend.position = "right") +
+      labs(title = paste("CNV Score -", sample_name),
+           x = "X (microns)", y = "Y (microns)")
+
+    # Stemness category spatial plot
+    stem_colors <- c("Low" = "#2166AC", "Medium" = "#999999", "High" = "#B2182B")
+    p3 <- ggplot(sample_df, aes(x = x_centroid, y = y_centroid, color = stemness_category)) +
+      geom_point(size = 0.5, alpha = 0.7) +
+      scale_color_manual(values = stem_colors, name = "Stemness") +
+      coord_fixed() +
+      theme_minimal() +
+      theme(legend.position = "right") +
+      labs(title = paste("Stemness Category -", sample_name),
+           x = "X (microns)", y = "Y (microns)")
+
+    # Combined plot
+    p_combined <- p1 | p2 | p3
+    print(p_combined)
+
+    # Save
+    safe_name <- gsub("[^a-zA-Z0-9_-]", "_", sample_name)
+    ggsave(file.path(output_dir, paste0("spatial_stemness_cnv_", safe_name, ".png")),
+           p_combined, width = 18, height = 6, dpi = 300, bg = "white")
+  }
+
+} else {
+  cat("Spatial coordinates not available in the merged dataset.\n")
+}
+```
+
+### Spatial plot: Combined Stemness x CNV categories
+```{r spatial-combined, fig.width=12, fig.height=10}
+if (all(c("x_centroid", "y_centroid") %in% colnames(analysis_df))) {
+
+  # Create combined category
+  analysis_df$stemness_cnv_combined <- paste(analysis_df$stemness_category,
+                                              analysis_df$cnv_category,
+                                              sep = "_\n")
+
+  # Define colors for combined categories
+  combined_colors <- c(
+    "Low\nLow_CNV" = "#deebf7",
+    "Low\nHigh_CNV" = "#6baed6",
+    "Medium\nLow_CNV" = "#e5e5e5",
+    "Medium\nHigh_CNV" = "#fd8d3c",
+    "High\nLow_CNV" = "#fee5d9",
+    "High\nHigh_CNV" = "#d7191c"
+  )
+
+  # Plot for each sample
+  for (sample_name in unique(analysis_df$sample)) {
+    sample_df <- analysis_df %>%
+      filter(sample == sample_name)
+
+    p_combined <- ggplot(sample_df, aes(x = x_centroid, y = y_centroid, color = stemness_cnv_combined)) +
+      geom_point(size = 0.8, alpha = 0.8) +
+      scale_color_manual(values = combined_colors, name = "Stemness x CNV") +
+      coord_fixed() +
+      theme_minimal() +
+      theme(legend.position = "right") +
+      labs(title = paste("Stemness x CNV Combined -", sample_name),
+           x = "X (microns)", y = "Y (microns)")
+
+    print(p_combined)
+
+    safe_name <- gsub("[^a-zA-Z0-9_-]", "_", sample_name)
+    ggsave(file.path(output_dir, paste0("spatial_combined_categories_", safe_name, ".png")),
+           p_combined, width = 12, height = 10, dpi = 300, bg = "white")
+  }
+}
+```
+
+## Classical UM Chromosome Aberrations {.tabset}
+
+### High stemness vs high CNV analysis
+```{r um-aberrations}
+cat("\n=== Classical UM Chromosome Aberrations Context ===\n")
+cat("Note: Chromosome-level analysis requires gene-level CNV data from h5ad files.\n")
+cat("Current analysis uses aggregate CNV scores from infercnvpy.\n")
+
+cat("\nFor this analysis, CNV scores reflect overall genomic instability.\n")
+cat("Higher CNV scores indicate more chromosomal aberrations (gains/losses).\n")
+
+# Define quartiles
+stem_q75 <- quantile(analysis_df$Stemness_UCell, 0.75)
+stem_q25 <- quantile(analysis_df$Stemness_UCell, 0.25)
+cnv_q75 <- quantile(analysis_df$cnv_score, 0.75)
+cnv_q25 <- quantile(analysis_df$cnv_score, 0.25)
+
+# Create quartile groups
+analysis_df$stem_quartile <- cut(analysis_df$Stemness_UCell,
+                                 breaks = c(-Inf, stem_q25, stem_q75, Inf),
+                                 labels = c("Q1 (Low)", "Q2-Q3 (Mid)", "Q4 (High)"))
+analysis_df$cnv_quartile <- cut(analysis_df$cnv_score,
+                                breaks = c(-Inf, cnv_q25, cnv_q75, Inf),
+                                labels = c("Q1 (Low)", "Q2-Q3 (Mid)", "Q4 (High)"))
+
+# Crosstable
+quartile_table <- table(stem = analysis_df$stem_quartile,
+                        cnv = analysis_df$cnv_quartile)
+cat("\nQuartile crosstab:\n")
+print(quartile_table)
+
+# Chi-square test on quartiles
+quartile_test <- chisq.test(quartile_table)
+cat("\nChi-square test (quartiles):\n")
+cat("  p-value:", format(quartile_test$p.value, scientific = TRUE), "\n")
+```
+
+### Key findings summary
+```{r key-findings}
+cat("\n=== Key Findings Summary ===\n")
+
+# Proportion of high stemness cells with high CNV
+n_high_stem <- sum(analysis_df$stemness_category == "High")
+n_high_stem_high_cnv <- sum(analysis_df$stemness_category == "High" &
+                             analysis_df$cnv_category == "High_CNV")
+pct_high_stem_high_cnv <- 100 * n_high_stem_high_cnv / n_high_stem
+
+cat("\n1. High Stemness and CNV:\n")
+cat("   High stemness cells:", n_high_stem, "\n")
+cat("   High stemness + High CNV:", n_high_stem_high_cnv,
+    sprintf("(%.1f%%)\n", pct_high_stem_high_cnv))
+
+# Proportion of low stemness cells with high CNV
+n_low_stem <- sum(analysis_df$stemness_category == "Low")
+n_low_stem_high_cnv <- sum(analysis_df$stemness_category == "Low" &
+                           analysis_df$cnv_category == "High_CNV")
+pct_low_stem_high_cnv <- 100 * n_low_stem_high_cnv / n_low_stem
+
+cat("\n2. Low Stemness and CNV:\n")
+cat("   Low stemness cells:", n_low_stem, "\n")
+cat("   Low stemness + High CNV:", n_low_stem_high_cnv,
+    sprintf("(%.1f%%)\n", pct_low_stem_high_cnv))
+
+# Correlation interpretation
+cat("\n3. Correlation Interpretation:\n")
+if (cor_test$p.value < 0.05) {
+  if (cor_pearson > 0) {
+    cat("   Significant POSITIVE correlation (p <", format(cor_test$p.value, digits = 2), ")\n")
+    cat("   Higher stemness tends to associate with higher CNV burden\n")
+  } else {
+    cat("   Significant NEGATIVE correlation (p <", format(cor_test$p.value, digits = 2), ")\n")
+    cat("   Higher stemness tends to associate with lower CNV burden\n")
+  }
+} else {
+  cat("   No significant correlation (p =", format(cor_test$p.value, digits = 3), ")\n")
+  cat("   Stemness and CNV appear independent in this dataset\n")
+}
+```
+
+## Export Results {.tabset}
+
+### Export combined metadata
+```{r export-results}
+cat("\n=== Exporting Results ===\n")
+
+# Export the merged dataframe
+export_df <- analysis_df %>%
+  select(cell_id, barcode_suffix, Sample, CellType_Clean,
+         Stemness_UCell, stemness_category, cnv_score, cnv_category,
+         sample, x_centroid, y_centroid)
+
+output_file <- file.path(output_dir, "cytotrace_cnv_boston_combined.csv")
+write.csv(export_df, output_file, row.names = FALSE)
+cat("Exported to:", output_file, "\n")
+cat("  Rows:", nrow(export_df), "\n")
+cat("  Columns:", ncol(export_df), "\n")
+```
+
+### Summary report
+```{r summary-report}
+cat("\n=== Analysis Summary ===\n")
+cat("Completed at:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+
+cat("Dataset: Boston Sullivan cohort (Xenium)\n")
+cat("  Total cells analyzed:", nrow(analysis_df), "\n")
+cat("  Samples:", length(unique(analysis_df$sample)), "\n")
+cat("  Cell types:", length(unique(analysis_df$CellType_Clean)), "\n\n")
+
+cat("Key Results:\n")
+cat("  1. Pearson correlation:", round(cor_pearson, 4), "\n")
+cat("  2. Spearman correlation:", round(cor_spearman, 4), "\n")
+cat("  3. p-value:", format(cor_test$p.value, scientific = TRUE), "\n")
+cat("  4. High stemness + High CNV:", sprintf("%.1f%%", pct_high_stem_high_cnv), "\n")
+cat("  5. Low stemness + High CNV:", sprintf("%.1f%%", pct_low_stem_high_cnv), "\n")
+
+cat("\nOutput files:\n")
+cat("  - CSV: cytotrace_cnv_boston_combined.csv\n")
+cat("  - Plots: Various PNG files in", output_dir, "\n")
+```
+
+## Session Info
+
+```{r session-info}
+sessionInfo()
+```
